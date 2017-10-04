@@ -1,2 +1,4 @@
 rawdata
 *.dir
+*.sqlite
+*-checkpoint.ipynb
