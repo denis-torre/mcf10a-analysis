@@ -24,12 +24,14 @@ sys.path.append('../scripts')
 import Support as S
 import PipelineMcf10aP100 as P
 from cmapPy.pandasGEXpress import parse
+from mcf10a import *
 
 #############################################
 ########## 2. General Setup
 #############################################
 ##### 1. Variables #####
 rawDataFiles = glob.glob('../rawdata/p100/LINCS_P100_*.gct')
+drugFile = '../drugs.json'
 
 ##### 2. R Connection #####
 rSource = 'pipeline/scripts/pipeline-mcf10a-p100.R'
@@ -102,9 +104,43 @@ def getSampleAnnotations(infiles, outfile):
 
 	# Get dataframe
 	sample_annotation_dataframe = pd.concat([parse(x).col_metadata_df for x in infiles])
+	sample_annotation_dataframe['pert_iname'] = [x.lower() for x in sample_annotation_dataframe['pert_iname']]
 
 	# Write
 	sample_annotation_dataframe.to_csv(outfile, sep='\t')
+
+#######################################################
+#######################################################
+########## S3. Differential Expression
+#######################################################
+#######################################################
+
+#############################################
+########## 2. Get Design
+#############################################
+
+@follows(mkdir('s3-differential_expression.dir'))
+
+@merge([getSampleAnnotations, drugFile],
+	   's3-differential_expression.dir/p100-design.txt')
+
+def getDesign(infiles, outfile):
+
+	# Get infiles
+	sampleAnnotationFile, drugFile = infiles
+
+	# Read sample annotations
+	sample_metadata_dataframe = pd.read_table(sampleAnnotationFile, index_col='cid').fillna(0)#.rename(columns={''})
+
+	# Read drug dict
+	with open(drugFile) as openfile:
+		drug_dict = json.loads(openfile.read())
+
+	# Get design
+	design_dataframe = getDesignDataframe(sample_metadata_dataframe, drug_dict)
+	
+	# Save
+	design_dataframe.to_csv(outfile, sep='\t')
 
 #######################################################
 #######################################################
