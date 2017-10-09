@@ -1,5 +1,6 @@
 {
 	"drugs": ["dmso", "alpelisib", "dasatinib", "neratinib", "palbociclib", "trametinib"],
+	"selected_drugs": ["dasatinib", "neratinib", "trametinib"],
 	"concentration_groups": {
 		"cycif": {"A": 0.03, "B": 0.1, "C": 0.3, "D": 1, "E": 3},
 		"l1000": {"A": 0.04, "B": 0.12, "C": 0.37, "D": 1.11, "E": 3.33}

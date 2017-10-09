@@ -39,10 +39,13 @@ sampleAnnotationFile = '../rawdata/l1000/GSE70138_Broad_LINCS_inst_info_2017-03-
 expressionDataFile = 's1-expression_data.dir/l1000-data.txt'
 processedSampleAnnotationFile = 's2-annotations.dir/l1000-sample_annotations.txt'
 drugFile = '../drugs.json'
+signatureMatrixfile = 's3-differential_expression.dir/l1000-signature_matrix.txt'
 
 # Drugs
 with open(drugFile) as openfile:
-	drugs = json.loads(openfile.read())['drugs']
+	drugs_dict = json.loads(openfile.read())
+	drugs = drugs_dict['drugs']
+	selected_drugs = drugs_dict['selected_drugs']
 
 ##### 2. R Connection #####
 rSource = 'pipeline/scripts/pipeline-mcf10a-l1000.R'
@@ -292,6 +295,191 @@ def mergeGeneCoexpression(infiles, outfile):
 	# Save
 	merged_dataframe.to_csv(outfile, sep='\t')
 
+
+#######################################################
+#######################################################
+########## S6. Enrichment
+#######################################################
+#######################################################
+
+#############################################
+########## 1. Run Enrichr
+#############################################
+
+@follows(mkdir('s5-enrichr.dir'))
+
+@files(mergeDifferentialExpression,
+	   's5-enrichr.dir/l1000-enrichr_list_ids.txt')
+
+def runEnrichr(infile, outfile):
+
+	# Get signature dataframe
+	signature_dataframe = pd.read_table(infile, index_col='gene_symbol')
+
+	# Define dataframe list
+	dataframes = []
+
+	# Upload genesets
+	for signature in signature_dataframe.columns:
+		enrichr_id_dataframe = pd.DataFrame(S.uploadToEnrichr(signature_dataframe, signature, 100))
+		enrichr_id_dataframe['signature'] = signature
+		dataframes.append(enrichr_id_dataframe)
+
+	# Concatenate
+	merged_dataframe = pd.concat(dataframes)
+
+	# Write
+	merged_dataframe.to_csv(outfile, sep='\t', index=False)
+
+#############################################
+########## 2. Get results
+#############################################
+
+@transform(runEnrichr,
+		   suffix('list_ids.txt'),
+		   'results.txt')
+
+def getEnrichmentResults(infile, outfile):
+
+	# Get id dataframe
+	enrichr_id_dataframe = pd.read_table(infile)
+
+	# Define dataframe list
+	dataframes = []
+
+	# Loop through genesets
+	for index, rowData in enrichr_id_dataframe.iterrows():
+
+		# Get enrichment results
+		enrichment_results_dataframe = S.getEnrichmentResults(rowData['userListId'], gene_set_library='GO_Biological_Process_2015')
+		enrichment_results_dataframe['signature'] = rowData['signature']
+		enrichment_results_dataframe['geneset'] = rowData['geneset']
+
+		# Append
+		dataframes.append(enrichment_results_dataframe)
+
+	# Concatenate
+	merged_dataframe = pd.concat(dataframes)
+
+	# Write
+	merged_dataframe.to_csv(outfile, sep='\t', index=False)
+
+#############################################
+########## 3. Cast
+#############################################
+
+@follows(mkdir('s5-enrichr.dir/tables'))
+
+@subdivide(getEnrichmentResults,
+	   	   formatter(),
+	   	   's5-enrichr.dir/tables/l1000-*-table.txt',
+	   	   's5-enrichr.dir/tables/l1000-')
+
+def castEnrichmentResults(infile, outfiles, outfileRoot):
+
+	# Get id dataframe
+	enrichment_dataframe = pd.read_table(infile)
+
+	# Get logP
+	enrichment_dataframe['logFDR'] = -np.log10(enrichment_dataframe['FDR'])
+
+	# Get subset
+	geneset_enrichment_dataframes = {geneset: pd.pivot_table(enrichment_dataframe.query('geneset == "{geneset}"'.format(**locals())), index='term_name', columns='signature', values='logFDR').fillna(0) for geneset in enrichment_dataframe['geneset'].unique()}
+
+	# Save
+	for key, value in geneset_enrichment_dataframes.iteritems():
+
+		# Get outfile
+		outfile = '{outfileRoot}{key}-table.txt'.format(**locals())
+
+		# Save
+		value.to_csv(outfile, sep='\t')
+
+#############################################
+########## 4. Merge
+#############################################
+
+@merge(castEnrichmentResults,
+	   's5-enrichr.dir/l1000-enrichment_table.txt')
+
+def mergeEnrichmentResults(infiles, outfile):
+
+	# Read data
+	enrichment_tables = {os.path.basename(x).split('-')[1]: pd.read_table(x, index_col='term_name') for x in infiles}
+
+	# Filter terms
+	filtered_terms = {key: value.apply(np.sum, 1).sort_values(ascending=False).index for key, value in enrichment_tables.iteritems()}
+
+	# Filter data
+	filtered_enrichment_tables = {key: value.loc[filtered_terms[key]] for key, value in enrichment_tables.iteritems()}
+
+	# Change sign
+	filtered_enrichment_tables['downregulated'] = -filtered_enrichment_tables['downregulated']
+
+	# Get terms
+	terms = set(filtered_enrichment_tables['upregulated'].index).intersection(set(filtered_enrichment_tables['downregulated'].index))
+
+	# Get data dict
+	enrichment_dict = {x:{} for x in filtered_enrichment_tables['upregulated'].index}
+
+	# Fill
+	for term in terms:
+		for signature in filtered_enrichment_tables['upregulated'].columns:
+			direction = 'upregulated' if filtered_enrichment_tables['upregulated'].loc[term, signature] >= abs(filtered_enrichment_tables['downregulated'].loc[term, signature]) else 'downregulated'
+			enrichment_dict[term][signature] = filtered_enrichment_tables[direction].loc[term, signature]
+
+	# Convert to dataframe
+	enrichment_dataframe = pd.DataFrame(enrichment_dict).fillna(0).T
+	enrichment_dataframe.index.name = 'term_name'
+
+	# Write
+	enrichment_dataframe.to_csv(outfile, sep='\t')
+
+#######################################################
+#######################################################
+########## S6. Browser Data
+#######################################################
+#######################################################
+
+#############################################
+########## 1. Differential Expression
+#############################################
+
+def browserJobs():
+	infile = signatureMatrixfile
+	for drug in selected_drugs:
+		outfile = 's6-browser_data.dir/{drug}/l1000-{drug}-browser_genes.txt'.format(**locals())
+		if not os.path.exists(os.path.dirname(outfile)):
+			os.makedirs(os.path.dirname(outfile))
+		yield [infile, outfile]
+
+
+@follows(mkdir('s6-browser_data.dir'))
+
+@files(browserJobs)
+
+def getBrowserGenes(infile, outfile):
+
+	# Read data
+	signature_dataframe = pd.read_table(infile)
+
+	# Melt
+	melted_signature_dataframe = pd.melt(signature_dataframe, id_vars='gene_symbol', var_name='signature')
+
+	# Split data
+	signature_data = [x.split('_') for x in melted_signature_dataframe['signature']]
+	melted_signature_dataframe['drug'] = [x[0] for x in signature_data]
+	melted_signature_dataframe['concentration'] = [float(x[1]) for x in signature_data]
+	melted_signature_dataframe['timepoint'] = [int(x[2]) for x in signature_data]
+
+	# Get drug
+	drug = os.path.basename(outfile).split('-')[1]
+
+	# Subset
+	filtered_melted_signature_dataframe = melted_signature_dataframe.query('drug=="{drug}"'.format(**locals())).sort_values(['gene_symbol', 'timepoint', 'concentration'])
+
+	# Save
+	filtered_melted_signature_dataframe.to_csv(outfile, sep='\t', index=False)
 
 #######################################################
 #######################################################
