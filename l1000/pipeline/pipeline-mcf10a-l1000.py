@@ -12,10 +12,11 @@
 #############################################
 ##### 1. Python modules #####
 from ruffus import *
-import sys, json
+import sys, json, os
 import pandas as pd
 import numpy as np
-import rpy2.robjects as robjects
+from rpy2.robjects import r, pandas2ri
+pandas2ri.activate()
 
 ##### 2. Custom modules #####
 # Pipeline running
@@ -35,14 +36,16 @@ from mcf10a import *
 rawDataFile = '../rawdata/l1000/GSE70138_Broad_LINCS_Level2_GEX_n345976x978_2017-03-06.gctx'
 geneAnnotationFile = '../rawdata/l1000/GSE70138_Broad_LINCS_gene_info_2017-03-06.txt'
 sampleAnnotationFile = '../rawdata/l1000/GSE70138_Broad_LINCS_inst_info_2017-03-06.txt'
+expressionDataFile = 's1-expression_data.dir/l1000-data.txt'
+processedSampleAnnotationFile = 's2-annotations.dir/l1000-sample_annotations.txt'
 drugFile = '../drugs.json'
 
 # Drugs
-drugs = ['DMSO', 'trametinib', 'alpelisib', 'vorinostat', 'neratinib', 'paclitaxel', 'palbociclib', 'etoposide', 'dasatinib']
+with open(drugFile) as openfile:
+	drugs = json.loads(openfile.read())['drugs']
 
 ##### 2. R Connection #####
 rSource = 'pipeline/scripts/pipeline-mcf10a-l1000.R'
-r = robjects.r
 r.source(rSource)
 
 #######################################################
@@ -128,65 +131,166 @@ def getSampleAnnotations(infiles, outfile):
 #######################################################
 
 #############################################
-########## 2. Get Design
+########## 1. Run Characteristic Direction
 #############################################
 
-@follows(mkdir('s3-differential_expression.dir'))
+def differentialExpressionJobs():
+	group_count_dataframe = pd.read_table(processedSampleAnnotationFile).groupby(['pert_iname', 'pert_dose', 'pert_time']).size().rename('count').to_frame().reset_index()
+	filtered_count_dataframe = group_count_dataframe.query('pert_iname != "dmso" and count > 2 and pert_iname in ("'+'", "'.join(drugs)+'")')
+	infiles = [expressionDataFile, processedSampleAnnotationFile]
+	for index, rowData in filtered_count_dataframe.iterrows():
+		outfile = 's3-differential_expression.dir/cd/l1000-{pert_iname}_{pert_dose}_{pert_time}-differential_expression.txt'.format(**rowData)
+		yield [infiles, outfile]
 
-@merge([getSampleAnnotations, drugFile],
-	   's3-differential_expression.dir/l1000-design.txt')
+@follows(mkdir('s3-differential_expression.dir/cd'))
 
-def getDesign(infiles, outfile):
+@files(differentialExpressionJobs)
+
+def runDifferentialExpression(infiles, outfile):
 
 	# Get infiles
-	sampleAnnotationFile, drugFile = infiles
+	expressionDataFile, sampleAnnotationFile = infiles
 
-	# Read sample annotations
-	sample_metadata_dataframe = pd.read_table(sampleAnnotationFile, index_col='sample_id').fillna(0)#.rename(columns={''})
-
-	# Read drug dict
-	with open(drugFile) as openfile:
-		drug_dict = json.loads(openfile.read())
+	# Get expression data
+	l1000_dataframe = pd.read_table(expressionDataFile, index_col='gene_symbol')
 
 	# Get design
-	design_dataframe = getDesignDataframe(sample_metadata_dataframe, drug_dict)
-	
+	drug, dose, timepoint = os.path.basename(outfile).split('-')[1].split('_')
+
+	# Get annotation dataframe
+	sample_annotation_dataframe = pd.read_table(sampleAnnotationFile, index_col='sample_id')
+	sample_annotation_dataframe.index = [x.replace(':', '.') for x in sample_annotation_dataframe.index]
+
+	# Get samples
+	treated_samples = sample_annotation_dataframe.query('pert_iname == "{drug}" and pert_dose == {dose} and pert_time == {timepoint}'.format(**locals())).index.tolist()
+	control_samples = sample_annotation_dataframe.query('pert_iname == "dmso" and pert_time == {timepoint}'.format(**locals())).index.tolist()
+
+	# Run characteristic direction
+	print 'Running {outfile}...'.format(**locals())
+	cd_dataframe = pandas2ri.ri2py(r.runCharacteristicDirection(pandas2ri.py2ri(l1000_dataframe), treated_samples, control_samples))
+	cd_dataframe.index.name = 'gene_symbol'
+
+	# Write
+	cd_dataframe.to_csv(outfile, sep='\t')
+
+#############################################
+########## 2. Merge Results
+#############################################
+
+@merge(runDifferentialExpression,
+	   's3-differential_expression.dir/l1000-signature_matrix.txt')
+
+def mergeDifferentialExpression(infiles, outfile):
+
+	# Define dataframe list
+	dataframes = []
+
+	# Loop through infiles
+	for infile in infiles:
+
+		# Get signature label
+		signature = os.path.basename(infile).split('-')[1]
+
+		# Read data
+		dataframe = pd.read_table(infile, index_col='gene_symbol').rename(columns={'CD': signature})
+
+		# Append
+		dataframes.append(dataframe)
+
+	# Concatenate
+	# merged_dataframe = pd.concat(dataframes, axis=1)
+	merged_dataframe = reduce(lambda x, y: pd.merge(x, y, left_index=True, right_index=True), dataframes)
+
 	# Save
-	design_dataframe.to_csv(outfile, sep='\t')
+	merged_dataframe.to_csv(outfile, sep='\t')
 
-# #############################################
-# ########## 1. Run Differential Expression
-# #############################################
+#######################################################
+#######################################################
+########## S4. Coexpression
+#######################################################
+#######################################################
 
-# def differentialExpressionJobs():
-# 	drugs = pd.read_table(sampleAnnotationFile)['pert_iname'].unique()
-# 	for drug in drugs:
-# 		infiles = [processedDataFile, sampleAnnotationFile]
-# 		outfile = 's3-differential_expression.dir/{drug}-gcp_differential_expression.txt'.format(**locals())
-# 		yield [infiles, outfile]
+#############################################
+########## 1. Gene coexpression by drug
+#############################################
 
-# @follows(mkdir('s3-differential_expression.dir'))
+def coexpressionJobs():
+	group_count_dataframe = pd.read_table(processedSampleAnnotationFile).groupby(['pert_iname']).size().rename('count').to_frame().reset_index()
+	filtered_count_dataframe = group_count_dataframe.query('pert_iname != "dmso" and count > 2 and pert_iname in ("'+'", "'.join(drugs)+'")')
+	infiles = [expressionDataFile, processedSampleAnnotationFile]
+	for index, rowData in filtered_count_dataframe.iterrows():
+		outfile = 's4-coexpression.dir/corr/l1000-{pert_iname}-coexpression.txt'.format(**rowData)
+		yield [infiles, outfile]
 
-# @files(differentialExpressionJobs)
+@follows(mkdir('s4-coexpression.dir/corr'))
 
-# def runDifferentialExpression(infiles, outfile):
+@files(coexpressionJobs)
 
-# # Get infiles
-# processedDataFile, sampleAnnotationFile = infiles
+def getGeneCoexpression(infiles, outfile):
 
-# # Read data
-# gcp_dataframe = pd.read_table(processedDataFile, index_col='rid')
+	# Report
+	print 'Doing {outfile}...'.format(**locals())
 
-# # Read sample annotations
-# sample_metadata_dataframe = pd.read_table(sampleAnnotationFile)
+	# Get infiles
+	expressionDataFile, processedSampleAnnotationFile = infiles
 
-# # Get drug
-# drug = os.path.basename(outfile)[:-len('-gcp_differential_expression.txt')]
+	# Get expression data
+	l1000_dataframe = pd.read_table(expressionDataFile, index_col='gene_symbol')
 
-# # Get samples
-# treated_samples = sample_metadata_dataframe.query('pert_time == 24 and pert_iname == "{drug}" and '.format(**locals()))['cid']
+	# Get drug
+	drug = os.path.basename(outfile).split('-')[1]
 
-# print infiles, outfile
+	# Get annotation dataframe
+	sample_annotation_dataframe = pd.read_table(processedSampleAnnotationFile, index_col='sample_id')
+
+	# Get samples
+	samples = sample_annotation_dataframe.query('pert_iname == "{drug}"'.format(**locals())).index
+
+	# Get normalized subset
+	drug_expression_dataframe = l1000_dataframe[samples]/(l1000_dataframe[samples].apply(np.sum))
+
+	# Get correlation
+	correlation_dataframe = drug_expression_dataframe.T.corr(method='spearman')
+	np.fill_diagonal(correlation_dataframe.values, np.nan)
+	correlation_dataframe.index.name = 'source_gene_symbol'
+	correlation_dataframe.columns.name = 'target_gene_symbol'
+
+	# Melt
+	melted_correlation_dataframe = pd.melt(correlation_dataframe.reset_index(), id_vars='source_gene_symbol').dropna()
+
+	# Write
+	melted_correlation_dataframe.to_csv(outfile, sep='\t', index=False)
+
+#############################################
+########## 2. Merge Coexpression
+#############################################
+
+@merge(getGeneCoexpression,
+	   's4-coexpression.dir/l1000-coexpression_matrix.txt')
+
+def mergeGeneCoexpression(infiles, outfile):
+
+	# Define dataframe list
+	dataframes = []
+
+	# Loop through infiles
+	for infile in infiles:
+
+		# Get signature label
+		signature = os.path.basename(infile).split('-')[1]
+
+		# Read data
+		dataframe = pd.read_table(infile, index_col=['source_gene_symbol', 'target_gene_symbol']).rename(columns={'value': signature})
+
+		# Append
+		dataframes.append(dataframe)
+
+	# Concatenate
+	# merged_dataframe = pd.concat(dataframes, axis=1)
+	merged_dataframe = reduce(lambda x, y: pd.merge(x, y, left_index=True, right_index=True), dataframes)
+
+	# Save
+	merged_dataframe.to_csv(outfile, sep='\t')
 
 
 #######################################################
@@ -205,5 +309,5 @@ def getDesign(infiles, outfile):
 ########## Run pipeline
 ##################################################
 ##################################################
-pipeline_run([sys.argv[-1]], multiprocess=1, verbose=1)
+pipeline_run([sys.argv[-1]], multiprocess=4, verbose=1)
 print('Done!')
