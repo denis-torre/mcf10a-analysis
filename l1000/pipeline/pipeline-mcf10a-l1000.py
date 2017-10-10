@@ -295,7 +295,6 @@ def mergeGeneCoexpression(infiles, outfile):
 	# Save
 	merged_dataframe.to_csv(outfile, sep='\t')
 
-
 #######################################################
 #######################################################
 ########## S6. Enrichment
@@ -448,11 +447,10 @@ def mergeEnrichmentResults(infiles, outfile):
 def browserJobs():
 	infile = signatureMatrixfile
 	for drug in selected_drugs:
-		outfile = 's6-browser_data.dir/{drug}/l1000-{drug}-browser_genes.txt'.format(**locals())
+		outfile = 's6-browser_data.dir/{drug}/l1000-{drug}-browser_genes.json'.format(**locals())
 		if not os.path.exists(os.path.dirname(outfile)):
 			os.makedirs(os.path.dirname(outfile))
 		yield [infile, outfile]
-
 
 @follows(mkdir('s6-browser_data.dir'))
 
@@ -461,10 +459,50 @@ def browserJobs():
 def getBrowserGenes(infile, outfile):
 
 	# Read data
-	signature_dataframe = pd.read_table(infile)
+	signature_dataframe = pd.read_table(infile, index_col='gene_symbol')
+
+	# Get drug
+	drug = os.path.basename(outfile).split('-')[1]
+
+	# Filter dataframe
+	filtered_signature_dataframe = signature_dataframe[[x for x in signature_dataframe.columns if drug in x]]
+
+	# Get top genes
+	top_genes = abs(filtered_signature_dataframe).apply(np.sum, 1).sort_values(ascending=False).index.tolist()[:25]
+
+	# Write
+	with open(outfile, 'w') as openfile:
+		openfile.write(json.dumps(top_genes))
+
+#############################################
+########## 2. Get Browser Signatures
+#############################################
+
+@transform(getBrowserGenes,
+		   suffix('genes.json'),
+		   add_inputs(mergeDifferentialExpression),
+		   'signatures.txt')
+
+def getBrowserSignatures(infiles, outfile):
+
+	# Split infiles
+	genesFile, signatureFile = infiles
+
+	# Read genes
+	with open(genesFile) as openfile:
+		genes = json.loads(openfile.read())
+
+	# Get drug
+	drug = os.path.basename(outfile).split('-')[1]
+
+	# Read data
+	signature_dataframe = pd.read_table(signatureFile).set_index('gene_symbol', drop=False)
+
+	# Filter
+	filtered_signature_dataframe = signature_dataframe.loc[genes, ['gene_symbol']+[x for x in signature_dataframe.columns if drug in x]]
 
 	# Melt
-	melted_signature_dataframe = pd.melt(signature_dataframe, id_vars='gene_symbol', var_name='signature')
+	melted_signature_dataframe = pd.melt(filtered_signature_dataframe, id_vars='gene_symbol', var_name='signature')
 
 	# Split data
 	signature_data = [x.split('_') for x in melted_signature_dataframe['signature']]
@@ -472,14 +510,47 @@ def getBrowserGenes(infile, outfile):
 	melted_signature_dataframe['concentration'] = [float(x[1]) for x in signature_data]
 	melted_signature_dataframe['timepoint'] = [int(x[2]) for x in signature_data]
 
-	# Get drug
-	drug = os.path.basename(outfile).split('-')[1]
-
 	# Subset
-	filtered_melted_signature_dataframe = melted_signature_dataframe.query('drug=="{drug}"'.format(**locals())).sort_values(['gene_symbol', 'timepoint', 'concentration'])
+	filtered_melted_signature_dataframe = melted_signature_dataframe.query('drug=="{drug}"'.format(**locals())).sort_values(['gene_symbol', 'timepoint', 'concentration']).query('timepoint == 24')
 
 	# Save
 	filtered_melted_signature_dataframe.to_csv(outfile, sep='\t', index=False)
+
+#############################################
+########## 3. Get Browser Coexpression
+#############################################
+
+@follows(getBrowserSignatures)
+
+@transform(getBrowserGenes,
+		   suffix('genes.json'),
+		   add_inputs(mergeGeneCoexpression),
+		   'coexpression.txt')
+
+def getBrowserCoexpression(infiles, outfile):
+
+	# Split infiles
+	genesFile, coexpressionFile = infiles
+
+	# Read genes
+	with open(genesFile) as openfile:
+		genes = json.loads(openfile.read())
+
+	# Get drug
+	drug = os.path.basename(outfile).split('-')[1]
+
+	# Read data
+	coexpression_dataframe = pd.read_table(coexpressionFile).set_index('source_gene_symbol', drop=False)
+
+	# Filter
+	genes_str = '("'+'", "'.join(genes)+'")'
+	filtered_coexpression_dataframe = coexpression_dataframe[['source_gene_symbol', 'target_gene_symbol', drug]].rename(columns={drug: 'value'}).query('source_gene_symbol in {genes_str} and target_gene_symbol in {genes_str}'.format(**locals()))
+
+	# Convert to json
+	coexpression_data = [{'source': {'id': rowData['source_gene_symbol'], 'start': 0, 'end': 1}, 'target': {'id': rowData['target_gene_symbol'], 'start': 0, 'end': 1}, 'value': rowData['value']} for index, rowData in filtered_coexpression_dataframe.iterrows()]
+
+	# Write
+	filtered_coexpression_dataframe.to_csv(outfile, sep='\t')
 
 #######################################################
 #######################################################
